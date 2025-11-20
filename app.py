@@ -876,7 +876,18 @@ def display_moo_summary(moo_out):
         return
 
     st.markdown("## 📋 Disaster Site Delivery Summary (Best solution)")
-    st.dataframe(summary['df'], use_container_width=True)
+    # Create a display copy with units in column headers so numeric data remains numeric for plotting
+    df_display = summary['df'].copy()
+    rename_map = {}
+    if 'distance_km' in df_display.columns:
+        rename_map['distance_km'] = 'distance_km (km)'
+    if 'delivery_time_min' in df_display.columns:
+        rename_map['delivery_time_min'] = 'delivery_time_min (min)'
+    if rename_map:
+        df_display = df_display.rename(columns=rename_map)
+
+    # show the display dataframe (with units in headers)
+    st.dataframe(df_display, use_container_width=True)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -901,7 +912,8 @@ def display_moo_summary(moo_out):
     pie_fig = px.pie(values=[summary['total_delivered'], summary['total_shortage']], names=['Fulfilled', 'Shortage'], title='Overall Fulfillment', color_discrete_sequence=['green', 'red'])
     st.plotly_chart(pie_fig, use_container_width=True)
 
-    csv = summary['df'].to_csv(index=False)
+    # use the display df (with labeled units) for CSV download so the headers include units
+    csv = df_display.to_csv(index=False)
     st.download_button("⬇️ Download per-site summary (CSV)", data=csv, file_name="per_site_summary.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------
