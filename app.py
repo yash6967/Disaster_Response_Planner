@@ -82,13 +82,20 @@ class Particle:
         self.lat_max = lat_max
         self.lon_min = lon_min
         self.lon_max = lon_max
-        # initialize uniformly inside dynamic bbox
+        # initialize uniformly inside dynamic bbox (may be replaced by seeds later)
         self.position = [
             random.uniform(lat_min, lat_max) if i % 2 == 0 else random.uniform(lon_min, lon_max)
             for i in range(self.dimensions)
         ]
-        # small random velocity
-        self.velocity = [random.uniform(-0.001, 0.001) for _ in range(self.dimensions)]
+        # small random velocity (scaled to bbox)
+        lat_range = max(abs(lat_max - lat_min), 1e-6)
+        lon_range = max(abs(lon_max - lon_min), 1e-6)
+        self.max_vel_lat = lat_range * 0.2
+        self.max_vel_lon = lon_range * 0.2
+        self.velocity = [
+            random.uniform(-self.max_vel_lat, self.max_vel_lat) if i % 2 == 0 else random.uniform(-self.max_vel_lon, self.max_vel_lon)
+            for i in range(self.dimensions)
+        ]
         self.best_position = list(self.position)
         self.best_fitness = float('inf')
 
@@ -122,17 +129,121 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=3, supply_vector=None):
         lon_max += 0.001
 
     DIMENSIONS = num_relief_centers * 2
-    swarm = [Particle(num_relief_centers, lat_min, lat_max, lon_min, lon_max) for _ in range(SWARM_SIZE)]
 
-    # evaluate initial swarm
+    # Helper: greedy simulator to evaluate RC positions (used as PSO fitness)
+    def eval_positions_as_fitness(pos_vector):
+        # pos_vector length = 2 * num_relief_centers
+        # Build RC list
+        rcs = []
+        for i in range(num_relief_centers):
+            lat = pos_vector[2 * i]
+            lon = pos_vector[2 * i + 1]
+            rcs.append({'lat': lat, 'lon': lon, 'supply': int(supply_vector[i]) if supply_vector and i < len(supply_vector) else 0})
+
+        # copy demand remaining
+        demand_remaining = [ds.get('demand', 0) for ds in disaster_sites]
+        priority = [ds.get('people_affected', 1) * ds.get('severity_level', 1) for ds in disaster_sites]
+        total_time = 0.0
+        total_distance = 0.0
+        priority_fulfillment = 0.0
+
+        # For each RC do greedy nearest-DS allocations until supply exhausted
+        for rc in rcs:
+            supply_left = rc['supply']
+            if supply_left <= 0:
+                continue
+            # compute distances to DS
+            ds_order = sorted(range(len(disaster_sites)),
+                              key=lambda j: haversine_km(rc['lat'], rc['lon'], disaster_sites[j]['lat'], disaster_sites[j]['lon']))
+            for j in ds_order:
+                if supply_left <= 0:
+                    break
+                if demand_remaining[j] <= 0:
+                    continue
+                alloc = min(supply_left, demand_remaining[j])
+                if alloc <= 0:
+                    continue
+                d = haversine_km(rc['lat'], rc['lon'], disaster_sites[j]['lat'], disaster_sites[j]['lon'])
+                # time (minutes) using same speed as haversine_distance_time
+                time_min = (d / 30.0) * 60.0
+                total_time += time_min * alloc
+                total_distance += d * alloc
+                priority_fulfillment += alloc * (priority[j] if priority[j] is not None else 0)
+                supply_left -= alloc
+                demand_remaining[j] -= alloc
+
+        total_demand = sum(ds.get('demand', 0) for ds in disaster_sites) or 1.0
+        total_shortage = sum(max(0, r) for r in demand_remaining)
+        # conservative unused estimate: for each RC compute supply minus total demand (clamped), then sum
+        total_unused = sum(max(0, rc['supply'] - total_demand) for rc in rcs)
+
+        # Compose fitness: primary goals -> minimize total_time, minimize shortages, then distance, penalize unused.
+        # Scales chosen to steer PSO toward serving demand first.
+        f_time = total_time / total_demand          # per-unit time
+        f_distance = total_distance / total_demand  # per-unit distance
+        f_shortage = total_shortage                 # absolute units short
+        f_unused = total_unused
+
+        # weights: shortage is most important
+        fitness_value = f_time + 0.5 * f_distance + 100.0 * (f_shortage / (total_demand)) + 10.0 * (f_unused / (total_demand + 1))
+        # subtract priority fulfillment (we want higher priority fulfillment -> lower fitness)
+        fitness_value -= 0.0001 * priority_fulfillment
+
+        # --- NEW: 500 m minimum separation penalty between any RC and any DS ---
+        # For each RC compute shortest distance to any disaster site; penalize violations smoothly.
+        min_sep_km = 0.5  # 0.5 km = 500 meters required minimum separation
+        sep_penalty_sum = 0.0
+        for rc in rcs:
+            # compute min distance from this RC to any DS
+            min_d = min(haversine_km(rc['lat'], rc['lon'], ds['lat'], ds['lon']) for ds in disaster_sites)
+            if min_d < min_sep_km:
+                # normalized violation (0..1): how much of the 500m buffer is violated
+                viol = (min_sep_km - min_d) / min_sep_km
+                sep_penalty_sum += viol
+        if sep_penalty_sum > 0:
+            # scale penalty so proximity violations strongly influence fitness:
+            # increase overall fitness (worse) by a large factor per full violation.
+            fitness_value += 2000.0 * sep_penalty_sum
+
+        return fitness_value
+
+    # build initial swarm with heuristic seeds + random particles
+    swarm = []
+    # seed1: place RCs at top high-priority disaster sites (repeat to create a few heuristic particles)
+    ds_priority_sorted = sorted(range(len(disaster_sites)), key=lambda i: disaster_sites[i].get('people_affected', 1) * disaster_sites[i].get('severity_level', 1), reverse=True)
+    num_seeds = min(len(ds_priority_sorted), max(1, SWARM_SIZE // 6))
+    for sidx in range(num_seeds):
+        particle = Particle(num_relief_centers, lat_min, lat_max, lon_min, lon_max)
+        # for each RC place at one of the top sites (cycle)
+        for rc_i in range(num_relief_centers):
+            ds_idx = ds_priority_sorted[(sidx + rc_i) % len(ds_priority_sorted)]
+            particle.position[2 * rc_i] = disaster_sites[ds_idx]['lat']
+            particle.position[2 * rc_i + 1] = disaster_sites[ds_idx]['lon']
+        particle.best_position = particle.position[:]
+        swarm.append(particle)
+
+    # seed2: demand-weighted centroid placement for all RCs (one or two particles)
+    centroid_lat = sum(ds.get('lat', 0) * ds.get('demand', 1) for ds in disaster_sites) / (sum(ds.get('demand', 1) for ds in disaster_sites) or 1)
+    centroid_lon = sum(ds.get('lon', 0) * ds.get('demand', 1) for ds in disaster_sites) / (sum(ds.get('demand', 1) for ds in disaster_sites) or 1)
+    for _ in range(min(2, SWARM_SIZE - len(swarm))):
+        particle = Particle(num_relief_centers, lat_min, lat_max, lon_min, lon_max)
+        for rc_i in range(num_relief_centers):
+            particle.position[2 * rc_i] = centroid_lat + random.uniform(-0.002, 0.002)
+            particle.position[2 * rc_i + 1] = centroid_lon + random.uniform(-0.002, 0.002)
+        particle.best_position = particle.position[:]
+        swarm.append(particle)
+
+    # fill remaining with random particles
+    while len(swarm) < SWARM_SIZE:
+        swarm.append(Particle(num_relief_centers, lat_min, lat_max, lon_min, lon_max))
+
+    # Evaluate initial swarm using inline evaluator (more aligned with allocation goals)
     global_best_position = None
     global_best_fitness = float('inf')
     for particle in swarm:
-        fitness = fitness_function(
-            particle.position,
-            disaster_sites,
-            supply_vector
-        )
+        # ensure inside bbox
+        particle.clamp_to_bbox()
+        fitness = eval_positions_as_fitness(particle.position)
         particle.best_fitness = fitness
         particle.best_position = particle.position[:]
         if fitness < global_best_fitness:
@@ -142,6 +253,7 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=3, supply_vector=None):
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    # PSO main loop with velocity clamping
     for iteration in range(MAX_ITER):
         for particle in swarm:
             for i in range(DIMENSIONS):
@@ -150,15 +262,17 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=3, supply_vector=None):
                 cognitive = C1 * r1 * (particle.best_position[i] - particle.position[i])
                 social = C2 * r2 * (global_best_position[i] - particle.position[i])
                 particle.velocity[i] = W * particle.velocity[i] + cognitive + social
+                # clamp velocity to fraction of bbox
+                if i % 2 == 0:
+                    particle.velocity[i] = max(min(particle.velocity[i], particle.max_vel_lat), -particle.max_vel_lat)
+                else:
+                    particle.velocity[i] = max(min(particle.velocity[i], particle.max_vel_lon), -particle.max_vel_lon)
                 particle.position[i] += particle.velocity[i]
             # clamp to dynamic bbox to force search inside user area
             particle.clamp_to_bbox()
 
-            fitness = fitness_function(
-                particle.position,
-                disaster_sites,
-                supply_vector
-            )
+            # evaluate using greedy simulator
+            fitness = eval_positions_as_fitness(particle.position)
             if fitness < particle.best_fitness:
                 particle.best_fitness = fitness
                 particle.best_position = particle.position[:]
@@ -167,7 +281,7 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=3, supply_vector=None):
                 global_best_position = particle.position[:]
 
         progress_bar.progress((iteration + 1) / MAX_ITER)
-        status_text.text(f"Iteration {iteration+1}/{MAX_ITER} | Best Fitness: {global_best_fitness:.2f}")
+        status_text.text(f"Iteration {iteration+1}/{MAX_ITER} | Best Fitness: {global_best_fitness:.4f}")
 
     progress_bar.empty()
     status_text.empty()
@@ -193,12 +307,10 @@ def run_pso_algorithm(disaster_sites, num_relief_centers=3, supply_vector=None):
             "area": f"Near {nearest_site.get('name', 'Unknown')}",
             "source": "PSO"
         })
-        # -------------------------------
-        # Print coordinates of all relief centres
-        # -------------------------------
-        st.subheader("📍 Relief Centre Coordinates (PSO Output)")
-        for rc in relief_centres:
-            st.write(f"**{rc['name']}** → Lat: `{rc['lat']}`, Lon: `{rc['lon']}`")
+    # Print coordinates once (moved out of loop)
+    st.subheader("📍 Relief Centre Coordinates (PSO Output)")
+    for rc in relief_centres:
+        st.write(f"**{rc['name']}** → Lat: `{rc['lat']}`, Lon: `{rc['lon']}`")
 
     return relief_centres
 
@@ -282,15 +394,11 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
     if total_supply < 1:
         st.warning(f"Total available supply ({total_supply}) is extremely low — results may be degenerate.")
 
-    ALPHA_UNUSED = 1.0
+    # reduce alpha unused and normalize objectives by total demand to help MOO search
+    ALPHA_UNUSED = 0.1
 
-    n_rc = len(relief_centres)
-    n_ds = len(disaster_sites)
-    n_var = n_rc * n_ds
-
-    xu = np.array([min(supply_vector[rc_idx], demand_vector[ds_idx])
-                   for rc_idx in range(n_rc) for ds_idx in range(n_ds)], dtype=float)
-    xl = np.zeros(n_var, dtype=float)
+    # compute demand normalization
+    total_demand = float(sum(ds.get("demand", 0) for ds in disaster_sites)) or 1.0
 
     class ResourceAllocationProblem(Problem):
         def __init__(self, relief_centers, disaster_sites, distance_matrix, time_matrix):
@@ -331,9 +439,10 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
                 unused_supply = float(np.sum(np.maximum(supply_vector - sum_per_rc, 0.0)))
                 penalty = ALPHA_UNUSED * unused_supply
 
-                f1[i] = total_time + penalty
-                f2[i] = total_distance + penalty
-                f3[i] = -priority_fulfillment + penalty
+                # normalize by total demand to keep magnitudes comparable
+                f1[i] = (total_time / (total_demand)) + penalty
+                f2[i] = (total_distance / (total_demand)) + penalty
+                f3[i] = (-priority_fulfillment / (total_demand)) + penalty
 
                 G[i, 0:len(self.disaster_sites)] = sum_per_ds - demand_vector
                 G[i, len(self.disaster_sites):] = sum_per_rc - supply_vector
@@ -377,12 +486,13 @@ def run_moo_algorithms(relief_centres, disaster_sites, mode='Full'):
                 exceed_supply = float(np.sum(np.maximum(sum_per_rc - supply_vector, 0.0)))
                 unused_supply = float(np.sum(np.maximum(supply_vector - sum_per_rc, 0.0)))
 
-                soft_penalty = 1e6 * (exceed_demand + exceed_supply)
+                # soften penalties so the algorithm can search; normalize objectives by total demand
+                soft_penalty = 1e4 * (exceed_demand + exceed_supply)
                 leftover_penalty = ALPHA_UNUSED * unused_supply
 
-                f1[i] = total_time + leftover_penalty + soft_penalty
-                f2[i] = total_distance + leftover_penalty + soft_penalty
-                f3[i] = -priority_fulfillment + leftover_penalty + soft_penalty
+                f1[i] = (total_time / (total_demand)) + leftover_penalty + soft_penalty
+                f2[i] = (total_distance / (total_demand)) + leftover_penalty + soft_penalty
+                f3[i] = (-priority_fulfillment / (total_demand)) + leftover_penalty + soft_penalty
 
             out["F"] = np.column_stack([f1, f2, f3])
 
@@ -876,18 +986,7 @@ def display_moo_summary(moo_out):
         return
 
     st.markdown("## 📋 Disaster Site Delivery Summary (Best solution)")
-    # Create a display copy with units in column headers so numeric data remains numeric for plotting
-    df_display = summary['df'].copy()
-    rename_map = {}
-    if 'distance_km' in df_display.columns:
-        rename_map['distance_km'] = 'distance_km (km)'
-    if 'delivery_time_min' in df_display.columns:
-        rename_map['delivery_time_min'] = 'delivery_time_min (min)'
-    if rename_map:
-        df_display = df_display.rename(columns=rename_map)
-
-    # show the display dataframe (with units in headers)
-    st.dataframe(df_display, use_container_width=True)
+    st.dataframe(summary['df'], use_container_width=True)
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -912,8 +1011,7 @@ def display_moo_summary(moo_out):
     pie_fig = px.pie(values=[summary['total_delivered'], summary['total_shortage']], names=['Fulfilled', 'Shortage'], title='Overall Fulfillment', color_discrete_sequence=['green', 'red'])
     st.plotly_chart(pie_fig, use_container_width=True)
 
-    # use the display df (with labeled units) for CSV download so the headers include units
-    csv = df_display.to_csv(index=False)
+    csv = summary['df'].to_csv(index=False)
     st.download_button("⬇️ Download per-site summary (CSV)", data=csv, file_name="per_site_summary.csv", mime="text/csv")
 
 # ---------------------------------------------------------------------
